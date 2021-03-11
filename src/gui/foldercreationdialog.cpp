@@ -19,8 +19,11 @@
 
 #include <QDir>
 #include <QMessageBox>
+#include <QLoggingCategory>
 
 namespace OCC {
+
+Q_LOGGING_CATEGORY(lcFolderCreationDialog, "nextcloud.gui.foldercreationdialog", QtInfoMsg)
 
 FolderCreationDialog::FolderCreationDialog(const QString &destination, QWidget *parent)
     : QDialog(parent)
@@ -37,7 +40,9 @@ FolderCreationDialog::FolderCreationDialog(const QString &destination, QWidget *
 
     const QString suggestedFolderNamePrefix = QObject::tr("New folder");
 
-    const auto newFolderFullPath = _destination + "/" + suggestedFolderNamePrefix;
+    qInfo(lcFolderCreationDialog) << "Before setting newFolderNameEdit";
+
+    const QString newFolderFullPath = _destination + "/" + suggestedFolderNamePrefix;
     if (!QDir(newFolderFullPath).exists()) {
         ui->newFolderNameEdit->setText(suggestedFolderNamePrefix);
     } else {
@@ -53,6 +58,8 @@ FolderCreationDialog::FolderCreationDialog(const QString &destination, QWidget *
 
     ui->newFolderNameEdit->setFocus();
     ui->newFolderNameEdit->selectAll();
+
+    qInfo(lcFolderCreationDialog) << "After setting newFolderNameEdit";
 }
 
 FolderCreationDialog::~FolderCreationDialog()
