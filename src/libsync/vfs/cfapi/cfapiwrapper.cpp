@@ -22,6 +22,8 @@
 #include <QFileInfo>
 #include <QLocalSocket>
 #include <QLoggingCategory>
+#include <QGlobalStatic>
+#include <QReadWriteLock>
 
 #include <sddl.h>
 #include <cfapi.h>
@@ -36,7 +38,9 @@ Q_LOGGING_CATEGORY(lcCfApiWrapper, "nextcloud.sync.vfs.cfapi.wrapper", QtInfoMsg
       FIELD_SIZE( CF_OPERATION_PARAMETERS, field ) )
 
 namespace {
-QMap<QString, QString> registeredSyncRootKeys;
+using SyncRootKeys = QMap<QString, QString>;
+Q_GLOBAL_STATIC(SyncRootKeys, registeredSyncRootKeys)
+QReadWriteLock registeredSyncRootKeysLock;
 void cfApiSendTransferInfo(const CF_CONNECTION_KEY &connectionKey, const CF_TRANSFER_KEY &transferKey, NTSTATUS status, void *buffer, qint64 offset, qint64 length)
 {
 
@@ -342,7 +346,7 @@ QString retrieveWindowsSID()
     return convertSidToStringSid(tokenInfo->User.Sid);
 }
 
-bool createSyncRootRegistryKeys(const QString &providerName, const QString &folderAlias, const QString &displayName, const QString &accountDisplayName, const QString& syncRootPath)
+bool createSyncRootRegistryKeys(const QString &providerName, const QString &folderAlias, const QString &displayName, const QString &accountDisplayName, const QString &syncRootPath)
 {
     // We must set specific Registry keys to make the progress bar refresh correctly and also add status icons into Windows Explorer
     // More about this here: https://docs.microsoft.com/en-us/windows/win32/shell/integrate-cloud-storage
@@ -385,22 +389,31 @@ bool createSyncRootRegistryKeys(const QString &providerName, const QString &fold
 
     if (isAnyKeySetFailed) {
         qCWarning(lcCfApiWrapper) << "Failed to set Registry keys for shell integration. Progress bar will not work.";
-        Q_ASSERT(!OCC::Utility::registryDeleteKeyTree(HKEY_LOCAL_MACHINE, providerSyncRootIdRegistryKey));
+        const auto deleteKeyResult = OCC::Utility::registryDeleteKeyTree(HKEY_LOCAL_MACHINE, providerSyncRootIdRegistryKey);
+        Q_ASSERT(!deleteKeyResult);
     } else {
-        registeredSyncRootKeys[syncRootPath] = providerSyncRootIdRegistryKey;
+        QWriteLocker lock(&registeredSyncRootKeysLock);
+        (*registeredSyncRootKeys)[syncRootPath] = providerSyncRootIdRegistryKey;
         qCInfo(lcCfApiWrapper) << "Successfully set Registry keys for shell integration at:" << providerSyncRootIdRegistryKey << ". Progress bar will work.";
     }
 
     return !isAnyKeySetFailed;
 }
 
-bool deleteSyncRootRegistryKey(const QString& syncRootPath)
+bool deleteSyncRootRegistryKey(const QString &syncRootPath)
 {
-    const auto foundRegisteredSyncRootKey = registeredSyncRootKeys.find(syncRootPath);
-    if (foundRegisteredSyncRootKey != registeredSyncRootKeys.end() && !foundRegisteredSyncRootKey->isEmpty()) {
-        bool result = OCC::Utility::registryDeleteKeyTree(HKEY_LOCAL_MACHINE, *foundRegisteredSyncRootKey);
-        registeredSyncRootKeys.remove(*foundRegisteredSyncRootKey);
-        return result;
+    const auto syncRootRegistryKeyToDelete = [&syncRootPath] {
+        QReadLocker lock(&registeredSyncRootKeysLock);
+        const auto foundRegisteredSyncRootKey = (*registeredSyncRootKeys).constFind(syncRootPath);
+        return (foundRegisteredSyncRootKey != (*registeredSyncRootKeys).constEnd()) ? *foundRegisteredSyncRootKey : QString();
+    }();
+
+    if (!syncRootRegistryKeyToDelete.isEmpty()) {
+        {
+            QWriteLocker lock(&registeredSyncRootKeysLock);
+            (*registeredSyncRootKeys).remove(syncRootRegistryKeyToDelete);
+        }
+        return OCC::Utility::registryDeleteKeyTree(HKEY_LOCAL_MACHINE, syncRootRegistryKeyToDelete);
     }
 
     return true;
@@ -409,7 +422,12 @@ bool deleteSyncRootRegistryKey(const QString& syncRootPath)
 OCC::Result<void, QString> OCC::CfApiWrapper::registerSyncRoot(const QString &path, const QString &providerName, const QString &providerVersion, const QString &folderAlias, const QString &displayName, const QString &accountDisplayName)
 {
     // even if we fail to register our sync root with shell, we can still proceed with using the VFS
-    Q_ASSERT(createSyncRootRegistryKeys(providerName, folderAlias, displayName, accountDisplayName, path));
+    const auto createRegistryKeyResult = createSyncRootRegistryKeys(providerName, folderAlias, displayName, accountDisplayName, path);
+    Q_ASSERT(createRegistryKeyResult);
+
+    if (!createRegistryKeyResult) {
+        qCWarning(lcCfApiWrapper) << "Failed to create the registry key for path:" << path;
+    }
 
     const auto p = path.toStdWString();
     const auto name = providerName.toStdWString();
@@ -442,7 +460,12 @@ OCC::Result<void, QString> OCC::CfApiWrapper::registerSyncRoot(const QString &pa
 
 OCC::Result<void, QString> OCC::CfApiWrapper::unregisterSyncRoot(const QString &path)
 {
-    Q_ASSERT(deleteSyncRootRegistryKey(path));
+    const auto deleteRegistryKeyResult = deleteSyncRootRegistryKey(path);
+    Q_ASSERT(deleteRegistryKeyResult);
+
+    if (!deleteRegistryKeyResult) {
+        qCWarning(lcCfApiWrapper) << "Failed to delete the registry key for path:" << path;
+    }
 
     const auto p = path.toStdWString();
     const qint64 result = CfUnregisterSyncRoot(p.data());
